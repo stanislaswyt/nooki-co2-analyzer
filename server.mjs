@@ -4,11 +4,14 @@ import { chromium, devices } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-/* -------------------- Config timeouts (surchargables par ENV) -------------------- */
+/* -------------------- Config -------------------- */
 const CONFIG = {
-  GOTO_TIMEOUT_MS:   +process.env.GOTO_TIMEOUT_MS   || 45_000,  // avant 30s
-  DOM_TIMEOUT_MS:    +process.env.DOM_TIMEOUT_MS    || 25_000,  // avant 15s
-  GLOBAL_TIMEOUT_MS: +process.env.GLOBAL_TIMEOUT_MS || 120_000, // avant 75s
+  GOTO_TIMEOUT_MS:   +process.env.GOTO_TIMEOUT_MS   || 45_000,
+  DOM_TIMEOUT_MS:    +process.env.DOM_TIMEOUT_MS    || 25_000,
+  GLOBAL_TIMEOUT_MS: +process.env.GLOBAL_TIMEOUT_MS || 120_000,
+  CACHE_TTL_MS:      +process.env.CACHE_TTL_MS      || 300_000, // 5 min
+  RELAUNCH_EVERY:    +process.env.RELAUNCH_EVERY    || 60,
+  MAX_CONCURRENCY:   +process.env.MAX_CONCURRENCY   || 1
 };
 
 /* -------------------- CORS -------------------- */
@@ -29,11 +32,10 @@ function isForbiddenHost(u) {
   } catch { return true; }
 }
 
-/* -------------------- Navigateur partagé (auto-recreate) -------------------- */
+/* -------------------- Navigateur partagé -------------------- */
 let browser = null;
 let launching = null;
 let analysesSinceLaunch = 0;
-const RELAUNCH_EVERY = +process.env.RELAUNCH_EVERY || 60; // relance périodique
 
 async function ensureBrowser() {
   if (browser) return browser;
@@ -64,36 +66,58 @@ async function ensureBrowser() {
   return launching;
 }
 
-/* -------------------- File d’attente (1 à la fois) -------------------- */
+/* -------------------- File d’attente avec anti-doublon -------------------- */
 const queue = [];
 let running = 0;
-const MAX_CONCURRENCY = +process.env.MAX_CONCURRENCY || 1; // 1 en Free
+const pendingUrls = new Map(); // url -> [resolveFns]
+const cache = new Map(); // url -> { time, result }
 
-function enqueue(task) {
+function enqueue(url, task) {
   return new Promise((resolve, reject) => {
-    queue.push({ task, resolve, reject });
+    // 1. Si en cache et frais → renvoie direct
+    const cached = cache.get(url);
+    if (cached && Date.now() - cached.time < CONFIG.CACHE_TTL_MS) {
+      return resolve(cached.result);
+    }
+
+    // 2. Si déjà en cours → on s'abonne au résultat
+    if (pendingUrls.has(url)) {
+      pendingUrls.get(url).push({ resolve, reject });
+      return;
+    }
+
+    // 3. Sinon, première demande pour cette URL → créer la liste d'attente
+    pendingUrls.set(url, [{ resolve, reject }]);
+    queue.push({ url, task });
     drain();
   });
 }
+
 async function drain() {
-  if (running >= MAX_CONCURRENCY || queue.length === 0) return;
-  const { task, resolve, reject } = queue.shift();
+  if (running >= CONFIG.MAX_CONCURRENCY || queue.length === 0) return;
+  const { url, task } = queue.shift();
   running++;
-  task()
-    .then(resolve)
-    .catch(reject)
-    .finally(() => {
-      running--;
-      drain();
-    });
+
+  try {
+    const result = await task();
+    cache.set(url, { time: Date.now(), result });
+
+    // Résoudre toutes les promesses liées à cette URL
+    pendingUrls.get(url).forEach(({ resolve }) => resolve(result));
+  } catch (err) {
+    pendingUrls.get(url).forEach(({ reject }) => reject(err));
+  } finally {
+    pendingUrls.delete(url);
+    running--;
+    drain();
+  }
 }
 
-/* Exposé pour le plugin : longueur de la file (sans le job en cours) */
 app.get("/queue", (_req, res) => {
-  res.json({ waiting: Math.max(0, queue.length), running, capacity: MAX_CONCURRENCY });
+  res.json({ waiting: Math.max(0, queue.length), running, capacity: CONFIG.MAX_CONCURRENCY });
 });
 
-/* -------------------- Utilitaires -------------------- */
+/* -------------------- Utils -------------------- */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function withTimeout(promise, ms, label = "timeout") {
@@ -103,7 +127,6 @@ async function withTimeout(promise, ms, label = "timeout") {
   finally { clearTimeout(to); }
 }
 
-/* Lecture perf avec retry si renavigation */
 async function readPerfWithRetry(page) {
   const read = () => page.evaluate(() => {
     const nav = performance.getEntriesByType("navigation")[0];
@@ -127,18 +150,17 @@ async function readPerfWithRetry(page) {
   }
 }
 
-/* -------------------- Une passe (mobile), ressources lourdes bloquées -------------------- */
+/* -------------------- Analyse -------------------- */
 async function analyzeOnce(url, fresh = false) {
-  // Relance périodique ou forcée si crash
-  if (fresh || analysesSinceLaunch >= RELAUNCH_EVERY) {
+  if (fresh || analysesSinceLaunch >= CONFIG.RELAUNCH_EVERY) {
     try { await browser?.close(); } catch {}
     browser = null;
   }
 
   const b = await ensureBrowser();
   const mobile = devices["Pixel 5"];
-
   let context, page;
+
   try {
     context = await b.newContext({
       ...mobile,
@@ -148,7 +170,6 @@ async function analyzeOnce(url, fresh = false) {
         "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
     });
 
-    // Bloquer images / médias / polices (grosse économie RAM/temps)
     await context.route("**/*", (route) => {
       const t = route.request().resourceType();
       if (["image","media","font"].includes(t)) return route.abort();
@@ -158,22 +179,17 @@ async function analyzeOnce(url, fresh = false) {
     context.setDefaultNavigationTimeout(CONFIG.GOTO_TIMEOUT_MS);
     page = await context.newPage();
 
-    // Aller jusqu'au 1er octet
     const resp = await page.goto(url, { waitUntil: "commit", timeout: CONFIG.GOTO_TIMEOUT_MS });
     if (!resp) throw new Error("No response");
 
-    // Attente souple d’un rendu minimal
     await page.waitForLoadState("domcontentloaded", { timeout: CONFIG.DOM_TIMEOUT_MS }).catch(()=>{});
     await sleep(1_200);
 
     const data = await readPerfWithRetry(page);
     analysesSinceLaunch++;
     return data;
-
   } catch (e) {
-    const msg = String(e?.message || e);
-    // si le navigateur/onglet/contexte a été fermé → recrée et retente 1 fois
-    if (/Target page, context or browser has been closed/i.test(msg) && fresh === false) {
+    if (/Target page, context or browser has been closed/i.test(String(e)) && !fresh) {
       browser = null;
       return await analyzeOnce(url, true);
     }
@@ -184,28 +200,22 @@ async function analyzeOnce(url, fresh = false) {
   }
 }
 
-/* -------------------- Endpoint /analyze (file + timeout global) -------------------- */
+/* -------------------- Endpoint /analyze -------------------- */
 app.get("/analyze", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "Missing url param" });
   if (isForbiddenHost(url)) return res.status(400).json({ error: "Forbidden host" });
 
-  // Info file pour le client
-  const position = queue.length;
-  res.setHeader("X-Queue-Position", String(position));
-
-  enqueue(async () => {
-    try {
-      // Timeout global paramétrable
+  try {
+    const result = await enqueue(url, async () => {
       const v = await withTimeout(analyzeOnce(url), CONFIG.GLOBAL_TIMEOUT_MS, "Global analyze timeout");
 
-      // Hypothèses (1 seule passe mobile)
       const assumptions = {
         mobile_share: 1.0,
         network_wh_per_mb_mobile: 0.08,
-        network_wh_per_mb_fixed: 0.04, // non utilisé ici
+        network_wh_per_mb_fixed: 0.04,
         client_power_w_mobile: 2,
-        client_power_w_desktop: 20,    // non utilisé ici
+        client_power_w_desktop: 20,
         server_wh_per_view: 0.03,
         grid_g_per_kwh: 45,
       };
@@ -221,7 +231,7 @@ app.get("/analyze", async (req, res) => {
       const total_kwh = (network_wh + client_wh + server_wh) / 1000;
       const co2_g     = total_kwh * assumptions.grid_g_per_kwh;
 
-      res.json({
+      return {
         url,
         page_bytes_mb: Number(mb.toFixed(3)),
         requests: reqs,
@@ -230,25 +240,24 @@ app.get("/analyze", async (req, res) => {
         server_wh: Number(server_wh.toFixed(6)),
         co2_g: Number(co2_g.toFixed(6)),
         assumptions,
-      });
-    } catch (e) {
-      browser = null; // recrée au prochain appel
-      console.error("[/analyze] error:", e.stack || e.message || e);
-      res.status(500).json({ error: e.message || "Analyze failed" });
-    }
-  }).catch(e => {
-    console.error("[/analyze] queue error:", e);
-    res.status(500).json({ error: "Queue error" });
-  });
+      };
+    });
+
+    res.json(result);
+  } catch (e) {
+    browser = null;
+    console.error("[/analyze] error:", e.stack || e.message || e);
+    res.status(500).json({ error: e.message || "Analyze failed" });
+  }
 });
 
-/* -------------------- Santé / keep-alive -------------------- */
+/* -------------------- Santé -------------------- */
 app.get("/", (_req, res) => res.send("OK"));
 app.get("/ping", (_req, res) => res.json({ ok: true, time: Date.now() }));
 
-/* -------------------- Shutdown propre -------------------- */
+/* -------------------- Shutdown -------------------- */
 async function shutdown() { try { await browser?.close(); } catch {} process.exit(0); }
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-app.listen(PORT, () => console.log("Nooki CO2 analyzer on :" + PORT));
+app.listen(PORT, () => console.log("Nooki CO2 analyzer running on :" + PORT));
