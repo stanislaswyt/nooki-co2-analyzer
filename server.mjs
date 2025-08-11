@@ -4,6 +4,7 @@ import { chromium, devices } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// CORS (autorise ton domaine en prod via CORS_ORIGIN)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN || "*");
   res.setHeader("Access-Control-Allow-Methods", "GET");
@@ -11,6 +12,7 @@ app.use((req, res, next) => {
   next();
 });
 
+// Sécurité simple anti-SSRF
 function isForbiddenHost(u) {
   try {
     const url = new URL(u);
@@ -18,13 +20,16 @@ function isForbiddenHost(u) {
     if (host === "localhost" || host === "127.0.0.1") return true;
     if (host.endsWith(".local")) return true;
     return false;
-  } catch { return true; }
+  } catch {
+    return true;
+  }
 }
 
+// --- ANALYSE D'UNE PASSE (mobile ou desktop) ---
 async function analyzeOnce(url, uaDevice) {
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage"]
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
   });
 
   const context = await browser.newContext({
@@ -39,21 +44,26 @@ async function analyzeOnce(url, uaDevice) {
   const page = await context.newPage();
 
   try {
-    page.setDefaultNavigationTimeout(45000);
-    const resp = await page.goto(url, {
-      timeout: 45000,
-      waitUntil: "domcontentloaded"
-    });
+    // 1) Aller jusqu'au premier octet (évite les timeouts stricts)
+    const resp = await page.goto(url, { timeout: 90000, waitUntil: "commit" });
     if (!resp) throw new Error("No response from server");
-    await page.waitForTimeout(1500); // laisser finir les assets tardifs
 
+    // 2) Attente souple d'un rendu minimal (sans planter si ça tarde)
+    await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(1500); // laisser finir quelques assets
+
+    // 3) Métriques de perf
     const data = await page.evaluate(() => {
       const nav = performance.getEntriesByType("navigation")[0];
       const res = performance.getEntriesByType("resource") || [];
       let bytes = 0;
       if (nav && nav.transferSize) bytes += nav.transferSize;
       for (const r of res) bytes += (r.transferSize || r.encodedBodySize || 0);
-      const duration_s = nav ? nav.duration / 1000 : 5;
+
+      // Fallback durée : min 5s pour éviter client_wh = 0
+      const raw = nav ? nav.duration / 1000 : 0;
+      const duration_s = Math.max(raw, 5);
+
       return {
         mb: bytes / (1024 * 1024),
         requests: (res?.length || 0) + 1,
@@ -70,6 +80,7 @@ async function analyzeOnce(url, uaDevice) {
   }
 }
 
+// --- RETRIES ---
 async function analyzeWithRetries(url, uaDevice, attempts = 2) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
@@ -83,6 +94,7 @@ async function analyzeWithRetries(url, uaDevice, attempts = 2) {
   throw lastErr || new Error("Unknown error");
 }
 
+// --- ENDPOINT ---
 app.get("/analyze", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: "Missing url param" });
@@ -102,6 +114,7 @@ app.get("/analyze", async (req, res) => {
       return res.status(500).json({ error: "Both runs failed" });
     }
 
+    // Moyenne si les deux réussissent, sinon garde la passe qui marche
     let mb, reqs, dur;
     if (ok(mobile) && ok(desktop)) {
       mb = (mobile.value.mb + desktop.value.mb) / 2;
@@ -109,9 +122,12 @@ app.get("/analyze", async (req, res) => {
       dur = (mobile.value.duration_s + desktop.value.duration_s) / 2;
     } else {
       const v = ok(mobile) ? mobile.value : desktop.value;
-      mb = v.mb; reqs = v.requests; dur = v.duration_s;
+      mb = v.mb;
+      reqs = v.requests;
+      dur = v.duration_s;
     }
 
+    // Hypothèses (éditables)
     const assumptions = {
       mobile_share: 0.6,
       network_wh_per_mb_mobile: 0.08,
@@ -122,6 +138,7 @@ app.get("/analyze", async (req, res) => {
       grid_g_per_kwh: 45
     };
 
+    // Calculs énergie + CO2
     const network_wh =
       mb *
       (assumptions.mobile_share * assumptions.network_wh_per_mb_mobile +
