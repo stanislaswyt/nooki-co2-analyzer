@@ -158,42 +158,80 @@ async function analyzeOnce(url, fresh = false) {
   }
 
   const b = await ensureBrowser();
-  const mobile = devices["Pixel 5"];
-  let context, page;
 
+  // 1) Essaie d'abord en Desktop (certains sites filtrent le mobile headless)
+  const desktopUA = {
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    viewport: { width: 1366, height: 850 },
+    deviceScaleFactor: 1,
+    isMobile: false,
+    hasTouch: false,
+    locale: "fr-FR",
+  };
+
+  let context, page;
   try {
     context = await b.newContext({
-      ...mobile,
+      ...desktopUA,
       ignoreHTTPSErrors: true,
-      viewport: mobile?.viewport || { width: 1080, height: 1920 },
-      userAgent: mobile?.userAgent ||
-        "Mozilla/5.0 (Linux; Android 12; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+      extraHTTPHeaders: {
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "Upgrade-Insecure-Requests": "1",
+      },
     });
 
+    // Bloque juste les polices et médias lourds (on laisse passer les images si besoin)
     await context.route("**/*", (route) => {
       const t = route.request().resourceType();
-      if (["image","media","font"].includes(t)) return route.abort();
+      if (t === "font" || t === "media") return route.abort();
       route.continue();
     });
 
     context.setDefaultNavigationTimeout(CONFIG.GOTO_TIMEOUT_MS);
     page = await context.newPage();
 
-    const resp = await page.goto(url, { waitUntil: "commit", timeout: CONFIG.GOTO_TIMEOUT_MS });
+    // 2) Aller directement jusqu’à DOMContentLoaded (bien accepté par bcp de CMS/pare-feux)
+    let resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: CONFIG.GOTO_TIMEOUT_MS });
     if (!resp) throw new Error("No response");
 
-    await page.waitForLoadState("domcontentloaded", { timeout: CONFIG.DOM_TIMEOUT_MS }).catch(()=>{});
-    await sleep(1_200);
+    // Fallback léger : si le DOM est vraiment tardif, on laisse 1,2 s pour les scripts init
+    await sleep(1200);
 
+    // 3) Lecture des perfs (avec retry si renavigation)
     const data = await readPerfWithRetry(page);
     analysesSinceLaunch++;
     return data;
+
   } catch (e) {
-    if (/Target page, context or browser has been closed/i.test(String(e)) && !fresh) {
-      browser = null;
-      return await analyzeOnce(url, true);
+    // Si ça sent le filtrage desktop, on retente en "Pixel 5" mobile
+    const msg = String(e?.message || e);
+    if (!fresh && /blocked|forbidden|closed|context was destroyed|navigation timeout/i.test(msg)) {
+      try { await page?.close(); } catch {}
+      try { await context?.close(); } catch {}
+
+      const mobile = devices["Pixel 5"];
+      context = await b.newContext({
+        ...mobile,
+        ignoreHTTPSErrors: true,
+        locale: "fr-FR",
+        extraHTTPHeaders: { "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8" },
+      });
+      await context.route("**/*", (route) => {
+        const t = route.request().resourceType();
+        if (t === "font" || t === "media") return route.abort();
+        route.continue();
+      });
+      page = await context.newPage();
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: CONFIG.GOTO_TIMEOUT_MS });
+      await sleep(1200);
+      const data = await readPerfWithRetry(page);
+      analysesSinceLaunch++;
+      return data;
     }
+    // Sinon : vrai échec
     throw e;
+
   } finally {
     try { await page?.close(); } catch {}
     try { await context?.close(); } catch {}
