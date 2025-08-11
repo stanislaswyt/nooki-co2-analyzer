@@ -4,7 +4,6 @@ import { chromium, devices } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// CORS – autorise ton domaine (pendant les tests on laisse tout)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN || "*");
   res.setHeader("Access-Control-Allow-Methods", "GET");
@@ -12,7 +11,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Petit filet de sécurité anti-SSRF
 function isForbiddenHost(u) {
   try {
     const url = new URL(u);
@@ -24,25 +22,41 @@ function isForbiddenHost(u) {
 }
 
 async function analyzeOnce(url, uaDevice) {
-  const browser = await chromium.launch({ args: ["--no-sandbox"] });
-  const context = await browser.newContext(uaDevice || {});
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage"]
+  });
+
+  const context = await browser.newContext({
+    ...uaDevice,
+    ignoreHTTPSErrors: true,
+    userAgent:
+      (uaDevice && uaDevice.userAgent) ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    viewport: (uaDevice && uaDevice.viewport) || { width: 1366, height: 768 }
+  });
+
   const page = await context.newPage();
 
   try {
-    const resp = await page.goto(url, { timeout: 30000, waitUntil: "load" });
-    if (!resp) throw new Error("No response");
-    await page.waitForTimeout(1200); // assets tardifs
+    page.setDefaultNavigationTimeout(45000);
+    const resp = await page.goto(url, {
+      timeout: 45000,
+      waitUntil: "domcontentloaded"
+    });
+    if (!resp) throw new Error("No response from server");
+    await page.waitForTimeout(1500); // laisser finir les assets tardifs
 
     const data = await page.evaluate(() => {
-      const nav = performance.getEntriesByType('navigation')[0];
-      const res = performance.getEntriesByType('resource') || [];
+      const nav = performance.getEntriesByType("navigation")[0];
+      const res = performance.getEntriesByType("resource") || [];
       let bytes = 0;
       if (nav && nav.transferSize) bytes += nav.transferSize;
       for (const r of res) bytes += (r.transferSize || r.encodedBodySize || 0);
       const duration_s = nav ? nav.duration / 1000 : 5;
       return {
-        mb: bytes / (1024*1024),
-        requests: res.length + 1,
+        mb: bytes / (1024 * 1024),
+        requests: (res?.length || 0) + 1,
         duration_s
       };
     });
@@ -50,9 +64,23 @@ async function analyzeOnce(url, uaDevice) {
     await browser.close();
     return data;
   } catch (e) {
+    console.error("[analyzeOnce] error:", e.message);
     await browser.close();
     throw e;
   }
+}
+
+async function analyzeWithRetries(url, uaDevice, attempts = 2) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await analyzeOnce(url, uaDevice);
+    } catch (e) {
+      lastErr = e;
+      await new Promise(r => setTimeout(r, 800));
+    }
+  }
+  throw lastErr || new Error("Unknown error");
 }
 
 app.get("/analyze", async (req, res) => {
@@ -61,18 +89,22 @@ app.get("/analyze", async (req, res) => {
   if (isForbiddenHost(url)) return res.status(400).json({ error: "Forbidden host" });
 
   try {
-    const mobileProfile = devices['Pixel 5'];
+    const mobileProfile = devices["Pixel 5"];
     const [mobile, desktop] = await Promise.allSettled([
-      analyzeOnce(url, mobileProfile),
-      analyzeOnce(url, null)
+      analyzeWithRetries(url, mobileProfile, 2),
+      analyzeWithRetries(url, null, 2)
     ]);
 
     const ok = v => v.status === "fulfilled";
-    if (!ok(mobile) && !ok(desktop)) throw new Error("Both runs failed");
+    if (!ok(mobile) && !ok(desktop)) {
+      const msg = `[analyze] both runs failed: mobile=${mobile?.reason?.message} desktop=${desktop?.reason?.message}`;
+      console.error(msg);
+      return res.status(500).json({ error: "Both runs failed" });
+    }
 
     let mb, reqs, dur;
     if (ok(mobile) && ok(desktop)) {
-      mb  = (mobile.value.mb + desktop.value.mb) / 2;
+      mb = (mobile.value.mb + desktop.value.mb) / 2;
       reqs = Math.round((mobile.value.requests + desktop.value.requests) / 2);
       dur = (mobile.value.duration_s + desktop.value.duration_s) / 2;
     } else {
@@ -90,11 +122,15 @@ app.get("/analyze", async (req, res) => {
       grid_g_per_kwh: 45
     };
 
-    const network_wh = mb * (assumptions.mobile_share * assumptions.network_wh_per_mb_mobile
-                    + (1 - assumptions.mobile_share) * assumptions.network_wh_per_mb_fixed);
+    const network_wh =
+      mb *
+      (assumptions.mobile_share * assumptions.network_wh_per_mb_mobile +
+        (1 - assumptions.mobile_share) * assumptions.network_wh_per_mb_fixed);
 
-    const client_wh = (assumptions.mobile_share * assumptions.client_power_w_mobile
-                    + (1 - assumptions.mobile_share) * assumptions.client_power_w_desktop) * (dur / 3600);
+    const client_wh =
+      (assumptions.mobile_share * assumptions.client_power_w_mobile +
+        (1 - assumptions.mobile_share) * assumptions.client_power_w_desktop) *
+      (dur / 3600);
 
     const server_wh = assumptions.server_wh_per_view;
 
@@ -112,6 +148,7 @@ app.get("/analyze", async (req, res) => {
       assumptions
     });
   } catch (e) {
+    console.error("[/analyze] fatal:", e.message);
     res.status(500).json({ error: e.message || "Analyze failed" });
   }
 });
