@@ -4,6 +4,13 @@ import { chromium, devices } from "playwright";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+/* -------------------- Config timeouts (surchargables par ENV) -------------------- */
+const CONFIG = {
+  GOTO_TIMEOUT_MS:   +process.env.GOTO_TIMEOUT_MS   || 45_000,  // avant 30s
+  DOM_TIMEOUT_MS:    +process.env.DOM_TIMEOUT_MS    || 25_000,  // avant 15s
+  GLOBAL_TIMEOUT_MS: +process.env.GLOBAL_TIMEOUT_MS || 120_000, // avant 75s
+};
+
 /* -------------------- CORS -------------------- */
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN || "*");
@@ -26,7 +33,7 @@ function isForbiddenHost(u) {
 let browser = null;
 let launching = null;
 let analysesSinceLaunch = 0;
-const RELAUNCH_EVERY = 60; // relance le navigateur de temps en temps pour éviter les fuites
+const RELAUNCH_EVERY = +process.env.RELAUNCH_EVERY || 60; // relance périodique
 
 async function ensureBrowser() {
   if (browser) return browser;
@@ -60,7 +67,7 @@ async function ensureBrowser() {
 /* -------------------- File d’attente (1 à la fois) -------------------- */
 const queue = [];
 let running = 0;
-const MAX_CONCURRENCY = 1; // garder 1 en Free
+const MAX_CONCURRENCY = +process.env.MAX_CONCURRENCY || 1; // 1 en Free
 
 function enqueue(task) {
   return new Promise((resolve, reject) => {
@@ -112,7 +119,7 @@ async function readPerfWithRetry(page) {
   try { return await read(); }
   catch (e) {
     if (/Execution context was destroyed/i.test(e?.message || "")) {
-      await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(()=>{});
+      await page.waitForLoadState("domcontentloaded", { timeout: 8_000 }).catch(()=>{});
       await sleep(800);
       return await read();
     }
@@ -148,14 +155,16 @@ async function analyzeOnce(url, fresh = false) {
       route.continue();
     });
 
-    context.setDefaultNavigationTimeout(30000);
+    context.setDefaultNavigationTimeout(CONFIG.GOTO_TIMEOUT_MS);
     page = await context.newPage();
 
-    const resp = await page.goto(url, { waitUntil: "commit", timeout: 30000 });
+    // Aller jusqu'au 1er octet
+    const resp = await page.goto(url, { waitUntil: "commit", timeout: CONFIG.GOTO_TIMEOUT_MS });
     if (!resp) throw new Error("No response");
 
-    await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(()=>{});
-    await sleep(800);
+    // Attente souple d’un rendu minimal
+    await page.waitForLoadState("domcontentloaded", { timeout: CONFIG.DOM_TIMEOUT_MS }).catch(()=>{});
+    await sleep(1_200);
 
     const data = await readPerfWithRetry(page);
     analysesSinceLaunch++;
@@ -181,14 +190,14 @@ app.get("/analyze", async (req, res) => {
   if (!url) return res.status(400).json({ error: "Missing url param" });
   if (isForbiddenHost(url)) return res.status(400).json({ error: "Forbidden host" });
 
-  // on met l’ID de file pour pouvoir afficher “X en attente” côté plugin si tu veux
+  // Info file pour le client
   const position = queue.length;
   res.setHeader("X-Queue-Position", String(position));
 
   enqueue(async () => {
     try {
-      // Timeout global de 75 s sur l’analyse complète
-      const v = await withTimeout(analyzeOnce(url), 75_000, "Global analyze timeout");
+      // Timeout global paramétrable
+      const v = await withTimeout(analyzeOnce(url), CONFIG.GLOBAL_TIMEOUT_MS, "Global analyze timeout");
 
       // Hypothèses (1 seule passe mobile)
       const assumptions = {
@@ -223,9 +232,8 @@ app.get("/analyze", async (req, res) => {
         assumptions,
       });
     } catch (e) {
-      // si le navigateur est tombé → recréé au prochain appel
-      browser = null;
-      console.error("[/analyze] error:", e.message);
+      browser = null; // recrée au prochain appel
+      console.error("[/analyze] error:", e.stack || e.message || e);
       res.status(500).json({ error: e.message || "Analyze failed" });
     }
   }).catch(e => {
