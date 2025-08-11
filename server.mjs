@@ -171,4 +171,5 @@ app.get("/analyze", async (req, res) => {
 });
 
 app.get("/", (req, res) => res.send("OK"));
+app.get("/ping", (req, res) => res.json({ ok: true, time: Date.now() }));
 app.listen(PORT, () => console.log("Nooki CO2 analyzer on :" + PORT));
