@@ -1,5 +1,5 @@
 # Image officielle Playwright avec Chromium/Firefox/WebKit + deps déjà installés
-FROM mcr.microsoft.com/playwright:v1.46.0-jammy
+FROM mcr.microsoft.com/playwright:v1.54.2-jammy
 
 WORKDIR /app
 
