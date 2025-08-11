@@ -43,27 +43,17 @@ async function analyzeOnce(url, uaDevice) {
 
   const page = await context.newPage();
 
-  try {
-    // 1) Aller jusqu'au premier octet (évite les timeouts stricts)
-    const resp = await page.goto(url, { timeout: 90000, waitUntil: "commit" });
-    if (!resp) throw new Error("No response from server");
-
-    // 2) Attente souple d'un rendu minimal (sans planter si ça tarde)
-    await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => {});
-    await page.waitForTimeout(1500); // laisser finir quelques assets
-
-    // 3) Métriques de perf
-    const data = await page.evaluate(() => {
+  // petite fonction pour lire les perfs
+  const readPerf = () =>
+    page.evaluate(() => {
       const nav = performance.getEntriesByType("navigation")[0];
       const res = performance.getEntriesByType("resource") || [];
       let bytes = 0;
       if (nav && nav.transferSize) bytes += nav.transferSize;
       for (const r of res) bytes += (r.transferSize || r.encodedBodySize || 0);
-
       // Fallback durée : min 5s pour éviter client_wh = 0
       const raw = nav ? nav.duration / 1000 : 0;
       const duration_s = Math.max(raw, 5);
-
       return {
         mb: bytes / (1024 * 1024),
         requests: (res?.length || 0) + 1,
@@ -71,6 +61,32 @@ async function analyzeOnce(url, uaDevice) {
       };
     });
 
+  try {
+    // 1) Aller jusqu'au premier octet (évite les timeouts stricts)
+    const resp = await page.goto(url, { timeout: 90000, waitUntil: "commit" });
+    if (!resp) throw new Error("No response from server");
+
+    // 2) Attente souple d'un rendu minimal (sans planter si ça tarde)
+    await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(1200); // laisser finir quelques assets
+
+    // 3) Lire les perfs, avec retry si "execution context destroyed" (renavigation)
+    const tryRead = async () => {
+      try {
+        return await readPerf();
+      } catch (e) {
+        const msg = (e && e.message) || "";
+        if (/Execution context was destroyed/i.test(msg)) {
+          // la page a renavigué → on attend un peu et on réessaie
+          await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+          await page.waitForTimeout(800);
+          return await readPerf();
+        }
+        throw e;
+      }
+    };
+
+    const data = await tryRead();
     await browser.close();
     return data;
   } catch (e) {
@@ -170,6 +186,8 @@ app.get("/analyze", async (req, res) => {
   }
 });
 
+// routes simples pour tests / keep-alive
 app.get("/", (req, res) => res.send("OK"));
 app.get("/ping", (req, res) => res.json({ ok: true, time: Date.now() }));
+
 app.listen(PORT, () => console.log("Nooki CO2 analyzer on :" + PORT));
