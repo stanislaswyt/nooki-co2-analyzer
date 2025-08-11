@@ -1,0 +1,12 @@
+{
+  "name": "nooki-co2-analyzer",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.46.0"
+  }
+}
