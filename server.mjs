@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 8080;
 const CONFIG = {
   GOTO_TIMEOUT_MS:   +process.env.GOTO_TIMEOUT_MS   || 45_000,
   DOM_TIMEOUT_MS:    +process.env.DOM_TIMEOUT_MS    || 25_000,
-  GLOBAL_TIMEOUT_MS: +process.env.GLOBAL_TIMEOUT_MS || 120_000,
+  GLOBAL_TIMEOUT_MS: +process.env.GLOBAL_TIMEOUT_MS || 150_000,
   CACHE_TTL_MS:      +process.env.CACHE_TTL_MS      || 300_000, // 5 min
   RELAUNCH_EVERY:    +process.env.RELAUNCH_EVERY    || 60,
   MAX_CONCURRENCY:   +process.env.MAX_CONCURRENCY   || 1
